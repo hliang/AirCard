@@ -114,24 +114,37 @@ def list_devices() -> list[dict]:
     return []
 
 
-def get_connected_device() -> dict | None:
-    """Picks the connected iPhone out of the enumerated devices."""
+def list_connected_devices() -> list[dict]:
+    """Returns normalized metadata for every usable paired device."""
     usable = [d for d in list_devices() if d.get("udid") and d.get("product")]
-    if not usable:
-        return None
-    # Enumeration order is not stable, and iPads can appear alongside the iPhone.
-    iphones = [d for d in usable if str(d["product"]).startswith("iPhone")]
-    device = (iphones or usable)[0]
+    return [
+        {
+            "udid": device["udid"],
+            "name": device.get("name") or "iPhone",
+            "version": device.get("version") or "Unknown",
+            "product": device["product"],
+            "language": device.get("language") or "en",
+            "locale": device.get("locale") or "",
+            "bold_text": device.get("bold_text"),
+        }
+        for device in usable
+    ]
 
-    return {
-        "udid": device["udid"],
-        "name": device.get("name") or "iPhone",
-        "version": device.get("version") or "Unknown",
-        "product": device["product"],
-        "language": device.get("language") or "en",
-        "locale": device.get("locale") or "",
-        "bold_text": device.get("bold_text"),
-    }
+
+def get_connected_device(udid: str | None = None) -> dict | None:
+    """Picks a connected device out of the enumerated ones.
+
+    When `udid` is given, that exact device is selected. Otherwise the first
+    iPhone is preferred, falling back to the first usable device. Enumeration
+    order is not stable and iPads can appear alongside the iPhone.
+    """
+    devices = list_connected_devices()
+    if not devices:
+        return None
+    if udid:
+        return next((d for d in devices if d["udid"] == udid), None)
+    iphones = [d for d in devices if str(d["product"]).startswith("iPhone")]
+    return (iphones or devices)[0]
 
 
 def syslog_command(udid: str) -> list[str] | None:

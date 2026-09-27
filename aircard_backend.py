@@ -43,6 +43,7 @@ for lp in lib_paths:
 from apply_card_skin import (
     native,
     operation_ok,
+    read_file,
     write_file,
     write_files_batch,
     remove_files,
@@ -54,16 +55,17 @@ from card_assets import CACHE_FILES, build_card_assets
 from aircard import (
     find_device_helper,
     get_connected_device,
+    list_connected_devices,
     load_saved_cards,
     save_cards,
 )
 
 
-def cmd_device():
+def cmd_device(udid: str | None = None):
     if not find_device_helper():
         print(json.dumps({"connected": False, "error": "device_helper_missing"}))
         return
-    device = get_connected_device()
+    device = get_connected_device(udid)
     if not device:
         print(json.dumps({"connected": False, "error": "no_device"}))
         return
@@ -71,6 +73,38 @@ def cmd_device():
     device["airlift_compatible"] = operation_ok(probe)
     device["connected"] = True
     print(json.dumps(device))
+
+
+def cmd_devices():
+    """Lists every usable paired device so the UI can offer a picker."""
+    if not find_device_helper():
+        print(json.dumps([]))
+        return
+    devices = list_connected_devices()
+    for device in devices:
+        device["connected"] = True
+    print(json.dumps(devices))
+
+
+def cmd_read_pass(udid: str, card_hash: str):
+    """Reads a Wallet pass's pass.json using the export-read-restore helper.
+
+    This temporarily MOVES the pass out of its original path and restores it,
+    so it is a research/diagnostic operation, not a safe read-only call.
+    """
+    if "/" in card_hash or card_hash in ("", ".", ".."):
+        print(json.dumps({"ok": False, "error": "invalid card hash"}))
+        return
+    target = f"/var/mobile/Library/Passes/Cards/{card_hash}.pkpass"
+    data = read_file(udid, target, "pass.json", retries=2)
+    if data is None:
+        print(json.dumps({"ok": False, "error": "read_failed"}))
+        return
+    print(json.dumps({
+        "ok": True,
+        "path": f"{target}/pass.json",
+        "content": data.decode("utf-8", "replace"),
+    }))
 
 
 def cmd_get_saved_cards():
@@ -568,7 +602,11 @@ def main():
     cmd = sys.argv[1]
     norm_cmd = cmd.lstrip("-")
     if norm_cmd == "device":
-        cmd_device()
+        cmd_device(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif norm_cmd == "devices":
+        cmd_devices()
+    elif norm_cmd == "read-pass" and len(sys.argv) > 3:
+        cmd_read_pass(sys.argv[2], sys.argv[3])
     elif norm_cmd == "cards":
         cmd_get_saved_cards()
     elif norm_cmd == "save-cards" and len(sys.argv) > 2:

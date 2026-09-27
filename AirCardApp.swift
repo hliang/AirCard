@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 // MARK: - Models
 
-struct DeviceInfo: Codable {
+struct DeviceInfo: Codable, Identifiable {
     var udid: String?
     var name: String?
     var version: String?
@@ -14,6 +14,14 @@ struct DeviceInfo: Codable {
     var bold_text: Bool?
     var airlift_compatible: Bool?
     var connected: Bool
+    var error: String?
+    var id: String { udid ?? "unknown" }
+}
+
+struct PassReadResult: Codable {
+    var ok: Bool
+    var path: String?
+    var content: String?
     var error: String?
 }
 
@@ -483,6 +491,8 @@ class AppViewModel: ObservableObject {
     @Published var selectedKeyDigit: String? = nil
     
     @Published var device: DeviceInfo?
+    @Published var devices: [DeviceInfo] = []
+    @Published var selectedDeviceUDID: String?
     @Published var isCheckingDevice = false
     @Published var isScanningCards = false
     @Published var cards: [CardItem] = []
@@ -503,6 +513,7 @@ class AppViewModel: ObservableObject {
     private let storageKey = "mak5er.aircard.savedCards"
     private let legacyStorageKey1 = "mak5er.savedCards"
     private let legacyStorageKey2 = "LumiCards.savedCards"
+    private let selectedDeviceKey = "mak5er.aircard.selectedDevice"
     
     nonisolated static let cardRegexes: [NSRegularExpression] = [
         try! NSRegularExpression(pattern: "/(?:Cards|Passes/Cards)/([-A-Za-z0-9_+=]{20,44})(?:\\.pkpass|\\.cache|\\.pkcache|/|\\s|\"|'|\\)|,|$)"),
@@ -520,6 +531,7 @@ class AppViewModel: ObservableObject {
             self.scriptDir = Bundle.main.bundleURL.deletingLastPathComponent().path
         }
         
+        self.selectedDeviceUDID = UserDefaults.standard.string(forKey: selectedDeviceKey)
         loadSavedCards()
         checkDevice()
     }
@@ -559,6 +571,28 @@ class AppViewModel: ObservableObject {
         return nil
     }
     
+    nonisolated private static func runBackend<T: Decodable>(
+        _ arguments: [String], as type: T.Type, scriptDir: String
+    ) -> T? {
+        let process = Process()
+        process.executableURL = pythonExecutableURL
+        process.environment = processEnvironment
+        process.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
+        process.arguments = arguments
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return try? JSONDecoder().decode(T.self, from: data)
+        } catch {
+            return nil
+        }
+    }
+
     nonisolated private static var processEnvironment: [String: String] {
         var env = ProcessInfo.processInfo.environment
         let path = env["PATH"] ?? ""
@@ -716,57 +750,127 @@ class AppViewModel: ObservableObject {
         }
     }
     
+    func dumpPassJSON(for cardId: String) {
+        guard let udid = device?.udid else {
+            errorMessage = "No iPhone connected."
+            return
+        }
+        statusText = "Reading pass.json…"
+        log("Reading pass.json for card \(cardId.prefix(8))… (the pass is temporarily moved and restored)")
+        let scriptDir = self.scriptDir
+
+        Task.detached {
+            let result = AppViewModel.runBackend(
+                ["aircard_backend.py", "--read-pass", udid, cardId],
+                as: PassReadResult.self, scriptDir: scriptDir
+            )
+            await MainActor.run {
+                guard let result else {
+                    self.statusText = "Failed to read pass.json."
+                    self.log("❌ pass.json read failed (no response from backend).")
+                    return
+                }
+                guard result.ok, let content = result.content else {
+                    self.statusText = "Failed to read pass.json."
+                    self.log("❌ pass.json read failed: \(result.error ?? "unknown error")")
+                    return
+                }
+                self.statusText = "pass.json dumped to Log."
+                self.log("===== pass.json — \(result.path ?? cardId) =====")
+                for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
+                    self.log(String(line))
+                }
+                self.log("===== end pass.json =====")
+                self.showLogs = true
+            }
+        }
+    }
+
     // MARK: - Device Connection
     
     func checkDevice() {
         isCheckingDevice = true
         statusText = "Checking connected devices..."
         let scriptDir = self.scriptDir
-        
+
         Task.detached {
-            let process = Process()
-            process.executableURL = AppViewModel.pythonExecutableURL
-            process.environment = AppViewModel.processEnvironment
-            process.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
-            process.arguments = ["aircard_backend.py", "--device"]
-            
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            
-            do {
-                try process.run()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                
-                if let dev = try? JSONDecoder().decode(DeviceInfo.self, from: data) {
-                    await MainActor.run {
-                        self.device = dev
-                        self.isCheckingDevice = false
-                        if dev.connected {
-                            self.statusText = "Connected to \(dev.name ?? "iPhone")"
-                            self.log("Device connected: \(dev.name ?? "iPhone") (\(dev.product ?? ""), iOS \(dev.version ?? ""))")
-                            self.applyDevicePreferences(from: dev)
-                        } else if dev.error == "device_helper_missing" {
-                            self.statusText = "Device tools are missing from this build."
-                            self.log("Bundled device_helper not found — detection cannot run.")
-                        } else {
-                            self.statusText = "No iPhone found. Please connect via USB."
-                        }
-                    }
-                } else {
-                    await MainActor.run {
-                        self.isCheckingDevice = false
-                        self.statusText = "No iPhone found. Please connect via USB."
-                    }
+            let list = AppViewModel.runBackend(
+                ["aircard_backend.py", "--devices"], as: [DeviceInfo].self, scriptDir: scriptDir
+            ) ?? []
+
+            let selectedUDID = await MainActor.run { () -> String? in
+                self.devices = list
+                let current = self.selectedDeviceUDID
+                let stillPresent = current != nil && list.contains { $0.udid == current }
+                if !stillPresent {
+                    let preferred = list.first { ($0.product ?? "").hasPrefix("iPhone") } ?? list.first
+                    self.selectedDeviceUDID = preferred?.udid
+                    UserDefaults.standard.set(preferred?.udid, forKey: self.selectedDeviceKey)
                 }
-            } catch {
+                return self.selectedDeviceUDID
+            }
+
+            guard let udid = selectedUDID else {
                 await MainActor.run {
+                    self.device = nil
                     self.isCheckingDevice = false
-                    self.statusText = "Device detection failed: \(error.localizedDescription)"
+                    self.statusText = "No iPhone found. Please connect via USB."
+                    self.log("No iPhone found on USB.")
                 }
+                return
+            }
+
+            let info = AppViewModel.runBackend(
+                ["aircard_backend.py", "--device", udid], as: DeviceInfo.self, scriptDir: scriptDir
+            )
+            await MainActor.run {
+                self.applyLoadedDevice(info, requestedUDID: udid)
             }
         }
+    }
+
+    func selectDevice(_ udid: String?) {
+        guard let udid, udid != selectedDeviceUDID else { return }
+        if isScanningCards { stopCardScanning() }
+        selectedDeviceUDID = udid
+        UserDefaults.standard.set(udid, forKey: selectedDeviceKey)
+        log("Switching to device \(udid)...")
+        refreshSelectedDevice()
+    }
+
+    func refreshSelectedDevice() {
+        guard let udid = selectedDeviceUDID else { return }
+        isCheckingDevice = true
+        statusText = "Loading selected device..."
+        let scriptDir = self.scriptDir
+
+        Task.detached {
+            let info = AppViewModel.runBackend(
+                ["aircard_backend.py", "--device", udid], as: DeviceInfo.self, scriptDir: scriptDir
+            )
+            await MainActor.run {
+                self.applyLoadedDevice(info, requestedUDID: udid)
+            }
+        }
+    }
+
+    private func applyLoadedDevice(_ info: DeviceInfo?, requestedUDID: String) {
+        isCheckingDevice = false
+        guard let info, info.connected else {
+            device = nil
+            if info?.error == "device_helper_missing" {
+                statusText = "Device tools are missing from this build."
+                log("Bundled device_helper not found — detection cannot run.")
+            } else {
+                statusText = "Selected iPhone is not reachable."
+                log("Selected device \(requestedUDID.prefix(8))… is not reachable.")
+            }
+            return
+        }
+        device = info
+        statusText = "Connected to \(info.name ?? "iPhone")"
+        log("Device connected: \(info.name ?? "iPhone") (\(info.product ?? ""), iOS \(info.version ?? ""))")
+        applyDevicePreferences(from: info)
     }
     
     func applyDevicePreferences(from dev: DeviceInfo) {
@@ -1447,6 +1551,7 @@ struct WalletCardView: View {
     let onPickImage: () -> Void
     let onClearImage: () -> Void
     let onDelete: () -> Void
+    let onDumpPassJSON: () -> Void
     
     @State private var isHovered = false
     @State private var isTargeted = false
@@ -1645,6 +1750,14 @@ struct WalletCardView: View {
                 .background(Color(NSColor.controlBackgroundColor))
                 .cornerRadius(6)
                 
+                Button(action: onDumpPassJSON) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Read this pass's pass.json and print it to the Log (research)")
+                
                 Spacer()
                 
                 // Status badge
@@ -1740,7 +1853,8 @@ struct ContentView: View {
                                     cardIndex: idx,
                                     onPickImage: { openCardImagePicker(for: vm.cards[idx].id) },
                                     onClearImage: { vm.clearCardImage(for: vm.cards[idx].id) },
-                                    onDelete: { vm.deleteCard(id: vm.cards[idx].id) }
+                                    onDelete: { vm.deleteCard(id: vm.cards[idx].id) },
+                                    onDumpPassJSON: { vm.dumpPassJSON(for: vm.cards[idx].id) }
                                 )
                             }
                         }
@@ -1839,7 +1953,34 @@ struct ContentView: View {
                     .fill(vm.device?.connected == true ? Color.green : Color.red)
                     .frame(width: 8, height: 8)
                 
-                if let dev = vm.device, dev.connected {
+                if vm.devices.count > 1 {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Picker("", selection: Binding(
+                            get: { vm.selectedDeviceUDID },
+                            set: { vm.selectDevice($0) }
+                        )) {
+                            ForEach(vm.devices) { item in
+                                Text(item.name ?? "iPhone").tag(item.udid)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: 150, alignment: .leading)
+
+                        if let dev = vm.device, dev.connected {
+                            Text("\(dev.product ?? "") · iOS \(dev.version ?? "")")
+                                .font(.system(size: 9))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                        } else {
+                            Text("Not reachable")
+                                .font(.system(size: 9))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                } else if let dev = vm.device, dev.connected {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(dev.name ?? "iPhone")
                             .font(.system(size: 11, weight: .semibold))
@@ -3045,6 +3186,15 @@ struct ContentView: View {
                     .fontWeight(.semibold)
                     .foregroundColor(.secondary)
                 Spacer()
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(vm.logs.joined(separator: "\n"), forType: .string)
+                }
+                .buttonStyle(.link)
+                .font(.caption2)
+                .disabled(vm.logs.isEmpty)
+                .help("Copy the entire activity log to the clipboard")
+
                 Button("Clear") {
                     vm.logs.removeAll()
                 }
@@ -3061,6 +3211,7 @@ struct ContentView: View {
                             Text(log)
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundColor(.secondary)
+                                .textSelection(.enabled)
                                 .id(idx)
                         }
                     }
